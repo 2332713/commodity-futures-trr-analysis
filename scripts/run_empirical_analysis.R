@@ -5,7 +5,7 @@ file_arg <- grep("^--file=", args, value = TRUE)
 script_path <- if (length(file_arg) > 0) {
   normalizePath(sub("^--file=", "", file_arg[[1]]), winslash = "/", mustWork = TRUE)
 } else {
-  normalizePath("empirical_R_final/scripts/run_empirical_analysis.R", winslash = "/", mustWork = TRUE)
+  normalizePath("scripts/run_empirical_analysis.R", winslash = "/", mustWork = TRUE)
 }
 
 script_dir <- dirname(script_path)
@@ -49,6 +49,11 @@ SECTOR_FILLS <- c(
   "Other" = "#CCCCCC"
 )
 
+TVP_INITIAL_WINDOW <- 252L
+TVP_FORGETTING_FACTOR <- 0.985
+TVP_COVARIANCE_DECAY <- 0.970
+IRF_HORIZON <- 10L
+SMOOTH_WINDOW <- 66L
 BOOTSTRAP_REPLICATIONS <- 5000L
 
 format_num <- function(x, digits = 3) {
@@ -67,10 +72,33 @@ format_pvalue <- function(x) {
 
 latex_escape <- function(x) {
   out <- as.character(x)
-  out <- gsub("\\\\", "\\\\textbackslash{}", out)
-  out <- gsub("&", "\\\\&", out, fixed = TRUE)
-  out <- gsub("%", "\\\\%", out, fixed = TRUE)
-  out <- gsub("_", "\\\\_", out, fixed = TRUE)
+  out <- gsub("\\", "\\textbackslash{}", out, fixed = TRUE)
+  out <- gsub("&", "\\&", out, fixed = TRUE)
+  out <- gsub("%", "\\%", out, fixed = TRUE)
+  out <- gsub("_", "\\_", out, fixed = TRUE)
+  out
+}
+
+safe_sd <- function(x) {
+  s <- stats::sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s <= 0) 1 else s
+}
+
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / safe_sd(x)
+}
+
+roll_mean <- function(x, window, min_obs = window) {
+  out <- rep(NA_real_, length(x))
+  if (length(x) == 0) return(out)
+  for (i in seq_along(x)) {
+    lo <- max(1L, i - window + 1L)
+    v <- x[lo:i]
+    ok <- is.finite(v)
+    if (sum(ok) >= min_obs) {
+      out[[i]] <- mean(v[ok])
+    }
+  }
   out
 }
 
@@ -78,24 +106,193 @@ read_analysis_dataset <- function(path) {
   if (!file.exists(path)) {
     stop("Analysis dataset not found: ", path)
   }
+
   data <- read.csv(path, stringsAsFactors = FALSE, fileEncoding = "UTF-8-BOM")
   required <- c(
-    "date", "commodity", "sector", "return", "tone", "tr", "trr", "trr_ma66",
-    "next_1_extreme", "next_5_extreme", "warning"
+    "date", "commodity", "symbol", "sector", "close",
+    "volume", "open_interest", "return", "tr", "tone"
   )
   missing <- setdiff(required, names(data))
   if (length(missing) > 0) {
     stop("Analysis dataset is missing required columns: ", paste(missing, collapse = ", "))
   }
+
+  forbidden <- c(
+    "trr", "trr_ma66", "next_1_extreme", "next_5_extreme",
+    "high_tone", "weak_resilience", "warning", "trr_level"
+  )
+  leaked <- intersect(forbidden, names(data))
+  if (length(leaked) > 0) {
+    stop("Analysis dataset contains result columns that must be estimated by the script: ",
+         paste(leaked, collapse = ", "))
+  }
+
   data$date <- as.Date(data$date)
+  numeric_cols <- c("close", "volume", "open_interest", "return", "tr", "tone")
+  for (col in numeric_cols) {
+    data[[col]] <- as.numeric(data[[col]])
+  }
+
   data$commodity <- factor(data$commodity, levels = COMMODITY_ORDER, ordered = TRUE)
   data <- data[order(data$commodity, data$date), ]
   data$commodity <- as.character(data$commodity)
-  data$next_1_extreme <- as.logical(data$next_1_extreme)
-  data$next_5_extreme <- as.logical(data$next_5_extreme)
-  data$warning <- as.logical(data$warning)
+  data <- data[complete.cases(data[, c("date", "commodity", "sector", "return", "tr", "tone")]), ]
   rownames(data) <- NULL
   data
+}
+
+stabilize_var_matrix <- function(a_mat, max_root = 0.98) {
+  roots <- tryCatch(eigen(a_mat, only.values = TRUE)$values, error = function(e) NA_complex_)
+  max_mod <- suppressWarnings(max(Mod(roots), na.rm = TRUE))
+  if (is.finite(max_mod) && max_mod > max_root) {
+    a_mat <- a_mat * (max_root / max_mod)
+  }
+  a_mat
+}
+
+make_positive_definite <- function(sigma) {
+  sigma <- (sigma + t(sigma)) / 2
+  diag(sigma) <- pmax(diag(sigma), 1e-6)
+  for (ridge in c(0, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3)) {
+    test <- try(chol(sigma + diag(ridge, nrow(sigma))), silent = TRUE)
+    if (!inherits(test, "try-error")) {
+      return(sigma + diag(ridge, nrow(sigma)))
+    }
+  }
+  diag(pmax(diag(sigma), 1e-4), nrow(sigma))
+}
+
+compute_trr_from_irf <- function(a_mat, sigma, horizon = IRF_HORIZON) {
+  a_mat <- stabilize_var_matrix(a_mat)
+  sigma <- make_positive_definite(sigma)
+  chol_lower <- t(chol(sigma))
+  response <- chol_lower[, 1L] / chol_lower[1L, 1L]
+  phi <- rep(NA_real_, horizon)
+
+  for (h in seq_len(horizon)) {
+    response <- a_mat %*% response
+    phi[[h]] <- response[[2L]]
+  }
+
+  abs_phi <- abs(phi)
+  denom <- sum(abs_phi, na.rm = TRUE) * sum(seq_len(horizon))
+  if (!is.finite(denom) || denom <= 0) {
+    return(0)
+  }
+  sum((seq_len(horizon) * abs_phi)^2, na.rm = TRUE) / denom
+}
+
+estimate_tvp_var_trr <- function(g) {
+  g <- g[order(g$date), ]
+  x <- cbind(tone = standardize(g$tone), tr = standardize(g$tr))
+  n <- nrow(x)
+  if (n <= TVP_INITIAL_WINDOW + IRF_HORIZON) {
+    stop("Not enough observations for ", unique(g$commodity))
+  }
+
+  init_end <- TVP_INITIAL_WINDOW
+  z_init <- cbind(1, x[1:(init_end - 1L), , drop = FALSE])
+  y_init <- x[2:init_end, , drop = FALSE]
+  beta <- solve(crossprod(z_init) + diag(1e-5, ncol(z_init)), crossprod(z_init, y_init))
+  p_mat <- solve(crossprod(z_init) + diag(1e-4, ncol(z_init)))
+  init_resid <- y_init - z_init %*% beta
+  sigma <- make_positive_definite(stats::cov(init_resid, use = "pairwise.complete.obs"))
+
+  trr <- rep(NA_real_, n)
+  tone_to_tr <- rep(NA_real_, n)
+  tr_persistence <- rep(NA_real_, n)
+
+  for (t in init_end:n) {
+    if (t > init_end) {
+      z_t <- c(1, x[t - 1L, ])
+      y_t <- x[t, ]
+      fitted_t <- as.vector(z_t %*% beta)
+      err_t <- y_t - fitted_t
+      denom <- TVP_FORGETTING_FACTOR + as.numeric(t(z_t) %*% p_mat %*% z_t)
+      gain <- (p_mat %*% z_t) / denom
+      beta <- beta + gain %*% t(err_t)
+      p_mat <- (p_mat - gain %*% t(z_t) %*% p_mat) / TVP_FORGETTING_FACTOR
+      sigma <- TVP_COVARIANCE_DECAY * sigma +
+        (1 - TVP_COVARIANCE_DECAY) * tcrossprod(err_t)
+      sigma <- make_positive_definite(sigma)
+    }
+
+    a_mat <- rbind(
+      c(beta[2L, 1L], beta[3L, 1L]),
+      c(beta[2L, 2L], beta[3L, 2L])
+    )
+    a_mat <- stabilize_var_matrix(a_mat)
+    tone_to_tr[[t]] <- a_mat[2L, 1L]
+    tr_persistence[[t]] <- a_mat[2L, 2L]
+    trr[[t]] <- compute_trr_from_irf(a_mat, sigma)
+  }
+
+  g$tone_z <- x[, "tone"]
+  g$tr_z <- x[, "tr"]
+  g$tone_to_tr <- tone_to_tr
+  g$tr_persistence <- tr_persistence
+  g$trr <- trr
+  g$trr_ma66 <- roll_mean(g$trr, SMOOTH_WINDOW, 10L)
+  g
+}
+
+estimate_empirical_panel <- function(data) {
+  pieces <- lapply(COMMODITY_ORDER, function(commodity) {
+    g <- data[data$commodity == commodity, ]
+    if (nrow(g) == 0) return(NULL)
+    estimate_tvp_var_trr(g)
+  })
+  panel <- do.call(rbind, pieces)
+  rownames(panel) <- NULL
+  panel
+}
+
+add_warning_variables <- function(panel) {
+  pieces <- lapply(COMMODITY_ORDER, function(commodity) {
+    g <- panel[panel$commodity == commodity, ]
+    g <- g[order(g$date), ]
+    n <- nrow(g)
+
+    threshold <- as.numeric(stats::quantile(g$return, probs = 0.05, type = 7, na.rm = TRUE))
+    extreme <- g$return < threshold
+
+    next_1 <- rep(NA, n)
+    if (n > 1L) {
+      next_1[1:(n - 1L)] <- extreme[2:n]
+    }
+
+    next_5_mat <- matrix(NA, nrow = n, ncol = 5L)
+    for (h in 1:5) {
+      if (n > h) {
+        next_5_mat[1:(n - h), h] <- extreme[(h + 1L):n]
+      }
+    }
+    next_5 <- apply(next_5_mat, 1L, function(v) {
+      if (all(is.na(v))) NA else any(v, na.rm = TRUE)
+    })
+
+    trr_mean <- mean(g$trr, na.rm = TRUE)
+    trr_sd <- stats::sd(g$trr, na.rm = TRUE)
+    eta1 <- trr_mean - 0.5 * trr_sd
+    eta2 <- trr_mean + 0.5 * trr_sd
+
+    g$extreme_threshold_5 <- threshold
+    g$next_1_extreme <- next_1
+    g$next_5_extreme <- next_5
+    g$high_tone <- g$tone > stats::median(g$tone, na.rm = TRUE)
+    g$weak_resilience <- g$trr >= eta2
+    g$warning <- g$high_tone & g$weak_resilience
+    g$trr_level <- ifelse(
+      g$trr < eta1,
+      "strong",
+      ifelse(g$trr < eta2, "moderate", "weak")
+    )
+    g$trr_level[is.na(g$trr)] <- NA_character_
+    g
+  })
+  panel <- do.call(rbind, pieces)
+  rownames(panel) <- NULL
+  panel
 }
 
 make_ranking_table <- function(data) {
@@ -120,7 +317,8 @@ make_ranking_table <- function(data) {
 }
 
 make_warning_table <- function(data) {
-  bootstrap_warning_pvalue <- function(warning, next_5_extreme, repetitions = BOOTSTRAP_REPLICATIONS) {
+  bootstrap_warning_pvalue <- function(warning, next_5_extreme,
+                                       repetitions = BOOTSTRAP_REPLICATIONS) {
     n <- length(warning)
     if (n == 0 || sum(warning, na.rm = TRUE) == 0) {
       return(NA_real_)
@@ -387,11 +585,13 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
       segments(stats[[4]], i, stats[[5]], i, col = "#2B2B2B", lwd = 0.75)
       segments(stats[[1]], i - 0.17, stats[[1]], i + 0.17, col = "#2B2B2B", lwd = 0.75)
       segments(stats[[5]], i - 0.17, stats[[5]], i + 0.17, col = "#2B2B2B", lwd = 0.75)
-      rect(stats[[2]], i - 0.27, stats[[4]], i + 0.27, col = box_fills[[i]], border = "#2B2B2B", lwd = 0.75)
+      rect(stats[[2]], i - 0.27, stats[[4]], i + 0.27,
+           col = box_fills[[i]], border = "#2B2B2B", lwd = 0.75)
       segments(stats[[3]], i - 0.27, stats[[3]], i + 0.27, col = "#0F0F0F", lwd = 1.05)
     }
     axis(1, lwd = 0.55, lwd.ticks = 0.55)
-    axis(2, at = seq_along(plot_order), labels = plot_order, las = 1, cex.axis = 0.62, lwd = 0.55, lwd.ticks = 0.55)
+    axis(2, at = seq_along(plot_order), labels = plot_order, las = 1,
+         cex.axis = 0.62, lwd = 0.55, lwd.ticks = 0.55)
     box(bty = "l", lwd = 0.65, col = "#1F1F1F")
     add_panel_title("(a) Commodity distributions", 0.070)
 
@@ -410,7 +610,8 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
     segments(xlim_all[[1]], y, ranking_asc$mean_trr, y, col = "#B8B8B8", lwd = 0.85)
     points(ranking_asc$mean_trr, y, pch = 21, bg = "#4A4A4A", col = "#1F1F1F", cex = 0.9, lwd = 0.7)
     axis(1, lwd = 0.55, lwd.ticks = 0.55)
-    axis(2, at = y, labels = ranking_asc$commodity, las = 1, cex.axis = 0.58, lwd = 0.55, lwd.ticks = 0.55)
+    axis(2, at = y, labels = ranking_asc$commodity, las = 1,
+         cex.axis = 0.58, lwd = 0.55, lwd.ticks = 0.55)
     box(bty = "l", lwd = 0.65, col = "#1F1F1F")
     add_panel_title("(b) Mean ranking", 0.565)
 
@@ -431,7 +632,8 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
     density_cols <- c("#2B2B2B", "#5A5A5A", "#8C8C8C")
     density_lty <- c(1, 2, 3)
     for (i in seq_along(density_list)) {
-      lines(density_list[[i]]$x, density_list[[i]]$y, col = density_cols[[i]], lwd = 1.05, lty = density_lty[[i]])
+      lines(density_list[[i]]$x, density_list[[i]]$y,
+            col = density_cols[[i]], lwd = 1.05, lty = density_lty[[i]])
     }
     axis(1, lwd = 0.55, lwd.ticks = 0.55)
     axis(2, lwd = 0.55, lwd.ticks = 0.55)
@@ -493,21 +695,24 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
 }
 
 analysis_data <- read_analysis_dataset(data_path)
-ranking_table <- make_ranking_table(analysis_data)
-warning_table <- make_warning_table(analysis_data)
+estimated_panel <- estimate_empirical_panel(analysis_data)
+estimated_panel <- add_warning_variables(estimated_panel)
+ranking_table <- make_ranking_table(estimated_panel)
+warning_table <- make_warning_table(estimated_panel)
 
 utils::write.csv(ranking_table, file.path(table_dir, "tab_trr_ranking.csv"), row.names = FALSE, fileEncoding = "UTF-8")
 utils::write.csv(warning_table, file.path(table_dir, "tab_warning.csv"), row.names = FALSE, fileEncoding = "UTF-8")
+utils::write.csv(estimated_panel, file.path(table_dir, "estimated_tvp_var_panel.csv"), row.names = FALSE, fileEncoding = "UTF-8")
 write_ranking_latex(ranking_table, file.path(table_dir, "tab_trr_ranking.tex"))
 write_warning_latex(warning_table, file.path(table_dir, "tab_warning.tex"))
 plot_trr_time(
-  analysis_data,
+  estimated_panel,
   file.path(figure_dir, "fig_trr_time.pdf"),
   file.path(figure_dir, "fig_trr_time.png"),
   file.path(figure_dir, "fig_trr_time.eps")
 )
 plot_trr_distribution(
-  analysis_data,
+  estimated_panel,
   file.path(figure_dir, "fig_trr_dist.pdf"),
   file.path(figure_dir, "fig_trr_dist.png"),
   file.path(figure_dir, "fig_trr_dist.eps")
@@ -517,5 +722,6 @@ cat("Done.\n")
 cat("Analysis dataset:       ", normalizePath(data_path, winslash = "/", mustWork = TRUE), "\n", sep = "")
 cat("Analysis sample:        ", format(min(analysis_data$date)), " to ", format(max(analysis_data$date)), "\n", sep = "")
 cat("Analysis rows:          ", nrow(analysis_data), "\n", sep = "")
+cat("TVP-VAR sample starts:  ", format(min(estimated_panel$date[is.finite(estimated_panel$trr)])), "\n", sep = "")
 cat("Weakest resilience:     ", ranking_table$commodity[[1]], "\n", sep = "")
 cat("Strongest resilience:   ", ranking_table$commodity[[nrow(ranking_table)]], "\n", sep = "")
