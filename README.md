@@ -1,7 +1,8 @@
 # R Empirical Analysis
 
-This folder contains a self-contained R workflow for reproducing the empirical
-figures and tables from a prepared analysis dataset.
+This R code implements a tail-risk resilience analysis model for Chinese
+commodity futures, evaluating how pessimistic tone and weak resilience relate
+to subsequent downside-risk events.
 
 ## Contents
 
