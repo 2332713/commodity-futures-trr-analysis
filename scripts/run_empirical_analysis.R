@@ -530,9 +530,10 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
     ranking <- make_ranking_table(data)
     order_desc <- ranking$commodity
     plot_order <- rev(order_desc)
-    xlim_all <- range(data$trr, na.rm = TRUE)
-    xpad <- diff(xlim_all) * 0.04
-    xlim_all <- c(xlim_all[[1]] - xpad, xlim_all[[2]] + xpad)
+    xlim_trr <- c(0, 0.30)
+    xlim_mean <- c(0, 0.12)
+    trr_ticks <- seq(0, 0.30, by = 0.10)
+    mean_ticks <- seq(0, 0.12, by = 0.04)
     data_list <- lapply(plot_order, function(commodity) {
       data$trr[data$commodity == commodity & is.finite(data$trr)]
     })
@@ -573,7 +574,7 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
     par(mar = c(3.0, 5.4, 2.0, 0.8))
     plot(
       NA,
-      xlim = xlim_all,
+      xlim = xlim_trr,
       ylim = c(0.5, length(data_list) + 0.5),
       xlab = "TRR",
       ylab = "",
@@ -589,7 +590,7 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
            col = box_fills[[i]], border = "#2B2B2B", lwd = 0.75)
       segments(stats[[3]], i - 0.27, stats[[3]], i + 0.27, col = "#0F0F0F", lwd = 1.05)
     }
-    axis(1, lwd = 0.55, lwd.ticks = 0.55)
+    axis(1, at = trr_ticks, lwd = 0.55, lwd.ticks = 0.55)
     axis(2, at = seq_along(plot_order), labels = plot_order, las = 1,
          cex.axis = 0.62, lwd = 0.55, lwd.ticks = 0.55)
     box(bty = "l", lwd = 0.65, col = "#1F1F1F")
@@ -601,15 +602,15 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
     plot(
       ranking_asc$mean_trr, y,
       type = "n",
-      xlim = xlim_all,
+      xlim = xlim_mean,
       ylim = c(0.5, length(y) + 0.5),
       xlab = "Mean TRR",
       ylab = "",
       axes = FALSE
     )
-    segments(xlim_all[[1]], y, ranking_asc$mean_trr, y, col = "#B8B8B8", lwd = 0.85)
+    segments(xlim_mean[[1]], y, ranking_asc$mean_trr, y, col = "#B8B8B8", lwd = 0.85)
     points(ranking_asc$mean_trr, y, pch = 21, bg = "#4A4A4A", col = "#1F1F1F", cex = 0.9, lwd = 0.7)
-    axis(1, lwd = 0.55, lwd.ticks = 0.55)
+    axis(1, at = mean_ticks, lwd = 0.55, lwd.ticks = 0.55)
     axis(2, at = y, labels = ranking_asc$commodity, las = 1,
          cex.axis = 0.58, lwd = 0.55, lwd.ticks = 0.55)
     box(bty = "l", lwd = 0.65, col = "#1F1F1F")
@@ -623,7 +624,7 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
     ymax <- max(vapply(density_list, function(d) max(d$y), numeric(1)))
     plot(
       NA,
-      xlim = xlim_all,
+      xlim = xlim_trr,
       ylim = c(0, ymax * 1.08),
       xlab = "TRR",
       ylab = "Density",
@@ -635,7 +636,7 @@ plot_trr_distribution <- function(data, path_pdf, path_png, path_eps) {
       lines(density_list[[i]]$x, density_list[[i]]$y,
             col = density_cols[[i]], lwd = 1.05, lty = density_lty[[i]])
     }
-    axis(1, lwd = 0.55, lwd.ticks = 0.55)
+    axis(1, at = trr_ticks, lwd = 0.55, lwd.ticks = 0.55)
     axis(2, lwd = 0.55, lwd.ticks = 0.55)
     box(bty = "l", lwd = 0.65, col = "#1F1F1F")
     legend(
