@@ -19,9 +19,3 @@ Run the empirical analysis from the project root:
 Rscript scripts/run_empirical_analysis.R
 ```
 
-On Windows, if R is not on your system path, use the full path to `Rscript.exe`:
-
-```powershell
-D:\Soft\R-4.5.2\bin\x64\Rscript.exe scripts\run_empirical_analysis.R
-```
-
