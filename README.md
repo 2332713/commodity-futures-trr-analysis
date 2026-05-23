@@ -25,5 +25,3 @@ On Windows, if R is not on your system path, use the full path to `Rscript.exe`:
 D:\Soft\R-4.5.2\bin\x64\Rscript.exe scripts\run_empirical_analysis.R
 ```
 
-The script reads `data/analysis_dataset.csv`, estimates the TVP-VAR model, and
-writes the generated figures and tables to `output/`.
