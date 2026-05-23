@@ -454,7 +454,7 @@ write_warning_latex <- function(table, path) {
     "\t\\vspace{0.3em}",
     "\t\\begin{minipage}{0.95\\textwidth}",
     "\t\t\\footnotesize",
-    "\t\tNotes: Warning days are days with high pessimistic report tone and weak tail-risk resilience. The 1-day and 5-day hit rates report the frequency of subsequent extreme downside returns. The unconditional hit rate and warning ratio use the same 5-day horizon. Bootstrap $p$-values are one-sided probabilities for the 5-day warning ratio being less than or equal to one, computed from 5,000 resamples.",
+    "\t\tNotes: Warning days are days with high pessimistic tone and weak tail-risk resilience. The 1-day and 5-day hit rates show the frequency of subsequent extreme downside returns. The unconditional hit rate and warning ratio use the same 5-day horizon. Bootstrap $p$-values are one-sided probabilities for the 5-day warning ratio being less than or equal to one, computed from 5,000 resamples.",
     "\t\\end{minipage}",
     "\\end{table}",
     ""
